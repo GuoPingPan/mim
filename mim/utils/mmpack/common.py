@@ -63,7 +63,7 @@ REGISTRY_TYPE = {
     'parameter scheduler': 'PARAM_SCHEDULERS',
     'param scheduler': 'PARAM_SCHEDULERS',
     'metric': 'METRICS',
-    'evaluator': 'EVALUATOR',
+    'evaluator': 'EVALUATOR',  # TODO EVALUATORS in mmagic
     'task utils': 'TASK_UTILS',
     'loop': 'LOOPS',
     'visualizer': 'VISUALIZERS',

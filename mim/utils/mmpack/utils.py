@@ -7,6 +7,7 @@ import logging
 import os
 import os.path as osp
 import re
+from functools import lru_cache
 from typing import Callable
 
 import torch.nn
@@ -49,7 +50,7 @@ def format_code(code_text: str):
     return code_text
 
 
-def get_all_files(directory: str):
+def _get_all_files(directory: str):
     """Get all files of the directory.
 
     Args:
@@ -61,8 +62,9 @@ def get_all_files(directory: str):
     file_paths = []
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if '__init__' not in file and 'registry' not in file:
+            if '__init__' not in file and 'registry.py' not in file:
                 file_paths.append(os.path.join(root, file))
+
     return file_paths
 
 
@@ -118,8 +120,8 @@ def _transfer_to_export_import(file_path: str):
                     export_module_path = module_path_dict[alias.name]
                 else:
                     assert module_path_dict[alias.name] == export_module_path,\
-                        "There are two module from the same downstream repo, but\
-                            can't change to the same export path."                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    # noqa: E501
+                        'There are two module from the same downstream repo,'\
+                        " but can't change to the same export path."
 
                 needed_change_alias.append(alias)
 
@@ -256,7 +258,7 @@ def _replace_config_scope_to_pack(file_path: str):
         file.write(updated_content)
 
 
-def _wrapper_all_registries_build_func(pack_module_dir: str, scope: str):
+def _wrapper_all_registries_build_func(export_module_dir: str, scope: str):
     """A function to wrap all registries' build_func.
 
     Args:
@@ -270,10 +272,10 @@ def _wrapper_all_registries_build_func(pack_module_dir: str, scope: str):
     # and change all the registry.locations
     repo_registries = importlib.import_module('.registry', scope)
     origin_file = inspect.getfile(repo_registries)
-    shutil.copy(origin_file, osp.join(pack_module_dir, 'registry.py'))
+    shutil.copy(origin_file, osp.join(export_module_dir, 'registry.py'))
 
     with open(
-            osp.join(pack_module_dir, 'registry.py'), 'r+',
+            osp.join(export_module_dir, 'registry.py'), 'r+',
             encoding='utf-8') as f:
         ast_tree = ast.parse(f.read())
         for node in ast.walk(ast_tree):
@@ -281,7 +283,7 @@ def _wrapper_all_registries_build_func(pack_module_dir: str, scope: str):
                 if 'mm' in node.value:
                     node.value = 'pack.' + node.value.split('.', 1)[-1]
 
-    with open(osp.join(pack_module_dir, 'registry.py'), 'w') as f:
+    with open(osp.join(export_module_dir, 'registry.py'), 'w') as f:
         f.write(format_code(ast.unparse(ast_tree)))
 
     # prevent circular registration
@@ -292,10 +294,146 @@ def _wrapper_all_registries_build_func(pack_module_dir: str, scope: str):
 
     # prevent circular wrapper
     if Registry.build.__name__ == 'wrapper':
-        Registry.build = _build(Registry.init_build_func, pack_module_dir)
+        Registry.build = _build(Registry.init_build_func, export_module_dir)
+        Registry.get = _get(Registry.init_get_func, export_module_dir)
     else:
         Registry.init_build_func = copy.deepcopy(Registry.build)
-        Registry.build = _build(Registry.build, pack_module_dir)
+        Registry.init_get_func = copy.deepcopy(Registry.get)
+        Registry.build = _build(Registry.build, export_module_dir)
+        Registry.get = _get(Registry.get, export_module_dir)
+
+
+@lru_cache
+def _export_module(self, obj_cls: type, pack_module_dir, obj_type: str):
+    """Export module.
+
+    This function will get the object's file and export to
+    ``pack_module_dir``.
+
+    If the object is built by ``MODELS`` registry, all the objects
+    as the top classes in this file, will be iteratively flattened.
+    Else will be directly exported.
+
+    The flatten logic is:
+        1. get the origin file of object, which built
+            by ``MODELS.build()``
+        2. get all the classes in the origin file
+        3. flatten all the classes but not only the object
+        4. call ``flatten_module()`` to finish flatten
+            according to ``class.mro()``
+
+    Args:
+        obj (object): The object to be flatten.
+    """
+    # find the file by obj class
+    file_path = inspect.getfile(obj_cls)
+
+    if osp.exists(file_path):
+        print_log(
+            f'[package: {pack_module_dir} ] building class: '
+            f'{obj_cls.__name__} from file: {file_path}.',
+            logger='current',
+            level=logging.INFO)
+    else:
+        raise FileExistsError(f"file [{file_path}] doesn't exist.")
+
+    # local origin module
+    module = obj_cls.__module__
+    parent, module_child_path = module.split('.', 1)
+
+    # prevent useless export
+    if 'mm' in module.split(
+            '.')[0] and parent != 'mmengine' and parent != 'mmcv':
+
+        with open(file_path, encoding='utf-8') as f:
+            top_ast_tree = ast.parse(f.read())
+
+        # deal with relative import
+        ModelNodeTransformer(module).visit(top_ast_tree)
+
+        # add a patch to deal with that some downstream repos rename the Registry  # noqa: E501
+        # for example:
+        #   1. BACKBONES = MODELS
+        #   2. use ``build_backbone`` but not ``MODELS.build()``
+        PatchTransformer().visit(top_ast_tree)
+
+        # NOTE: ``MODELS.build()`` means to flatten model module
+        if self.name == 'model':
+
+            # record all the class needed to be flattened
+            need_to_be_flattened_class_name = []
+            for node in top_ast_tree.body:
+                if isinstance(node, ast.ClassDef):
+                    need_to_be_flattened_class_name.append(node.name)
+
+            imported_module = importlib.import_module(obj_cls.__module__)
+            for cls_name in need_to_be_flattened_class_name:
+
+                # record the exported module for postprocessing the importfrom path  # noqa: E501
+                self.module_path_dict[cls_name] = 'pack.' + module_child_path
+
+                cls = getattr(imported_module, cls_name)
+
+                if_need_flatten_flag = False
+                for super_cls in cls.__bases__:
+
+                    # the class only will be flattened when:
+                    #   1. super class doesn't exist in this file
+                    #   2. and super class is not base class
+                    #   3. and super class is not torch module
+                    if super_cls.__name__\
+                        not in need_to_be_flattened_class_name \
+                        and (super_cls not in [BaseModule,
+                                               BaseModel,
+                                               BaseDataPreprocessor,
+                                               ImgDataPreprocessor]) \
+                            and 'torch' not in super_cls.__module__:  # noqa: E501
+
+                        if_need_flatten_flag = True
+                        break
+
+                if if_need_flatten_flag:
+                    print(f'need_flatten: {cls_name} super {super_cls}')
+                    flatten_module(top_ast_tree, cls)
+
+            postprocess_super(top_ast_tree)
+
+        else:
+            self.module_path_dict[
+                obj_cls.__name__] = 'pack.' + module_child_path
+
+        # add ``register_module(force=True)`` to cover the registered modules  # noqa: E501
+        RegisterModuleTransformer().visit(top_ast_tree)
+
+        # unparse ast tree and save reformat code
+        new_file_path = module_child_path.replace('.', '/') + '.py'
+        new_file_path = osp.join(pack_module_dir, new_file_path)
+        new_dir = osp.dirname(new_file_path)
+        mkdir_or_exist(new_dir)
+
+        with open(new_file_path, mode='w') as f:
+            f.write(format_code(ast.unparse(top_ast_tree)))
+
+    # deal with torch module
+    elif 'torch' in module.split('.')[0]:
+
+        # get the root registry, because it can get all the modules
+        # had been registered.
+        temp_registry = self if self.parent is None else self.parent
+        if (obj_type not in self.extra_nodule_set) and (
+                temp_registry.init_get_func(obj_type) is
+                None):  # TODO 这里不应该是 obj_cls.name因为注册名字可能不一样
+            self.extra_nodule_set.add(obj_type)
+            with open(osp.join(pack_module_dir, 'registry.py'), 'a') as f:
+
+                # TODO: the downstream repo registries' name maybe
+                # different with mmengine for example: EVALUATOR in
+                # mmengine, EVALUATORS in mmdet.
+                f.write('\n')
+                f.write(f'from {module} import {obj_cls.__name__}\n')
+                f.write(
+                    f"{REGISTRY_TYPE[self.name]}.register_module('{obj_type}', module={obj_cls.__name__}, force=True)"  # noqa: E501
+                )
 
 
 def _build(build_func: Callable, pack_module_dir: str):
@@ -303,160 +441,50 @@ def _build(build_func: Callable, pack_module_dir: str):
 
     Args:
         build_func (Callable): ``Registry.build()``, which will be wrapped.
-        pack_module_dir (str):  Modules export path.
+        pack_module_dir (str): Modules export path.
     """
 
     def wrapper(self, cfg: dict, *args, **kwargs):
 
-        def _export_module(obj: object):
-            """Export module.
-
-            This function will get the object's file and export to
-            ``pack_module_dir``.
-
-            If the object is built by ``MODELS`` registry, all the objects
-            as the top classes in this file, will be iteratively flattened.
-            Else will be directly exported.
-
-            The flatten logic is:
-                1. get the origin file of object, which built
-                    by ``MODELS.build()``
-                2. get all the classes in the origin file
-                3. flatten all the classes but not only the object
-                4. call ``flatten_module()`` to finish flatten
-                    according to ``class.mro()``
-
-            Args:
-                obj (object): The object to be flatten.
-            """
-            obj_cls = obj.__class__
-
-            # find the file by obj class
-            file_path = inspect.getfile(obj_cls)
-
-            if osp.exists(file_path):
-                print_log(
-                    f'[package {pack_module_dir} ] find file: {file_path}.',
-                    logger='current',
-                    level=logging.INFO)
-            else:
-                raise FileExistsError(f"file [{file_path}] doesn't exist.")
-
-            # local origin module
-            module = obj_cls.__module__
-            parent, module_child_path = module.split('.', 1)
-
-            # prevent useless export
-            if 'mm' in module.split(
-                    '.')[0] and parent != 'mmengine' and parent != 'mmcv':
-
-                with open(file_path, encoding='utf-8') as f:
-                    top_ast_tree = ast.parse(f.read())
-
-                # deal with relative import
-                ModelNodeTransformer(module).visit(top_ast_tree)
-
-                # add a patch to deal with that some downstream repos rename the Registry  # noqa: E501
-                # for example:
-                #   1. BACKBONES = MODELS
-                #   2. use ``build_backbone`` but not ``MODELS.build()``
-                PatchTransformer().visit(top_ast_tree)
-
-                # NOTE: ``MODELS.build()`` means to flatten model module
-                if self.name == 'model':
-
-                    # record all the class needed to be flattened
-                    need_to_be_flattened_class_name = []
-                    for node in top_ast_tree.body:
-                        if isinstance(node, ast.ClassDef):
-                            need_to_be_flattened_class_name.append(node.name)
-
-                    imported_module = importlib.import_module(
-                        obj_cls.__module__)
-                    for cls_name in need_to_be_flattened_class_name:
-
-                        # record the exported module for postprocessing the importfrom path  # noqa: E501
-                        self.module_path_dict[
-                            cls_name] = 'pack.' + module_child_path
-
-                        cls = getattr(imported_module, cls_name)
-
-                        if_need_flatten_flag = False
-                        for super_cls in cls.__bases__:
-
-                            # the class only will be flattened when:
-                            #   1. super class doesn't exist in this file
-                            #   2. and super class is not base class
-                            #   3. and super class is not torch module
-                            if super_cls.__name__\
-                                not in need_to_be_flattened_class_name \
-                                and (super_cls not in [BaseModule,
-                                                       BaseModel,
-                                                       BaseDataPreprocessor,
-                                                       ImgDataPreprocessor]) \
-                                    and 'torch' not in super_cls.__module__:  # noqa: E501
-
-                                if_need_flatten_flag = True
-                                break
-
-                        if if_need_flatten_flag:
-                            print(
-                                f'need_flatten: {cls_name} super {super_cls}')
-                            flatten_module(top_ast_tree, cls)
-
-                    postprocess_super(top_ast_tree)
-
-                else:
-                    self.module_path_dict[
-                        obj_cls.__name__] = 'pack.' + module_child_path
-
-                # add ``register_module(force=True)`` to cover the registered modules  # noqa: E501
-                RegisterModuleTransformer().visit(top_ast_tree)
-
-                # unparse ast tree and save reformat code
-                new_file_path = module_child_path.replace('.', '/') + '.py'
-                new_file_path = osp.join(pack_module_dir, new_file_path)
-                new_dir = osp.dirname(new_file_path)
-                mkdir_or_exist(new_dir)
-
-                with open(new_file_path, mode='w') as f:
-                    f.write(format_code(ast.unparse(top_ast_tree)))
-
-            # deal with torch module
-            elif 'torch' in module.split('.')[0]:
-
-                # get the root registry, because it can get all the modules
-                # had been registered.
-                temp_registry = self if self.parent is None else self.parent
-                if (obj_cls.__name__ not in self.extra_nodule_set) and (
-                        temp_registry.get(obj_cls.__name__) is None):
-                    self.extra_nodule_set.add(obj_cls.__name__)
-                    with open(osp.join(pack_module_dir, 'registry.py'),
-                              'a') as f:
-
-                        # TODO: the downstream repo registries' name maybe
-                        # different with mmengine for example: EVALUATOR in
-                        # mmengine, EVALUATORS in mmdet.
-                        f.write(f'from {module} import {obj_cls.__name__}\n')
-                        f.write(
-                            f'{REGISTRY_TYPE[self.name]}.register_module(module={obj_cls.__name__}, force=True)\n'  # noqa: E501
-                        )
-
+        # obj is class instanace
         obj = build_func(self, cfg, *args, **kwargs)
+        args = cfg.copy()  # type: ignore
+        obj_type = args.pop('type')  # type: ignore
+        obj_type = obj_type if isinstance(obj_type, str) else obj_type.__name__
 
         # modules in ``torch.nn.Sequential`` should be respectively exported
         if isinstance(obj, torch.nn.Sequential):
             for children in obj.children():
-                _export_module(children)
+                _export_module(self, children.__class__, pack_module_dir,
+                               obj_type)
         else:
-            _export_module(obj)
+            _export_module(self, obj.__class__, pack_module_dir, obj_type)
 
         return obj
 
     return wrapper
 
 
-def flatten_module(top_ast_tree: ast.Module, obj_cls: object):
+def _get(get_func: Callable, pack_module_dir: str):
+    """wrap Registry.get()
+
+    Args:
+        get_func (Callable): ``Registry.get()``, which will be wrapped.
+        pack_module_dir (str): Modules export path.
+    """
+
+    def wrapper(self, key: str):
+
+        obj_cls = get_func(self, key)
+
+        _export_module(self, obj_cls, pack_module_dir, obj_type=key)
+
+        return obj_cls
+
+    return wrapper
+
+
+def flatten_module(top_ast_tree: ast.Module, obj_cls: type):
     """Flatten the module. (Key Interface)
 
     The logic of the ``flatten_module`` are as below.
@@ -571,7 +599,9 @@ class ModelNodeTransformer(ast.NodeTransformer):
         import_prefix (str): The import prefix for the visit ast code
 
     Examples:
-        >>> # file_path = E:\\miniconda\\envs\torch2\\Lib\\site-packages\\mmdet\\models\\detectors\\dino.py  # noqa: E501
+        >>> # file_path = '/home/username/miniconda3/envs/env_name/lib' \
+        >>>               '/python3.9/site-packages/mmdet/models/detectors' \
+        >>>               '/dino.py'
         >>> import_prefix = mmdet.models.detector
     """
 
@@ -581,7 +611,7 @@ class ModelNodeTransformer(ast.NodeTransformer):
 
     def visit_ImportFrom(self, node):
 
-        # HACK: when the path is '.'
+        # HARD CODE: when the path is '.'
         # for example： from . import abc
         if node.module is None:
             import_prefix = ('.').join(
@@ -591,7 +621,7 @@ class ModelNodeTransformer(ast.NodeTransformer):
         else:
             if 'registry' in node.module:
 
-                # HACK: 'DefaultScope' must import from mmengine
+                # HARD CODE: 'DefaultScope' must import from mmengine
                 is_default_scope = False
                 for alias in node.names:
                     if 'DefaultScope' in alias.name:
@@ -608,7 +638,7 @@ class ModelNodeTransformer(ast.NodeTransformer):
                     self.import_prefix.split('.')[:-node.level])
                 node.module = import_prefix + '.' + node.module
 
-            # HACK: I don't remember
+            # HARD CODE: I don't remember
             for alias in node.names:
                 if alias.name in BUILDER_TRANS.keys():
                     node.module = 'pack.registry'
@@ -653,74 +683,3 @@ class PatchTransformer(ast.NodeTransformer):
                 node.module = 'mim.utils.mmpack.patch_utils.patch_task'
 
         return node
-
-
-if __name__ == '__main__':
-    # from mmpretrain.models import ResNeXt
-    # import inspect
-    # import ast
-    # from utils import format_code
-    # file_path = inspect.getfile(ResNeXt)
-    # with open(file_path) as f:
-    #     ast_tree = ast.parse(f.read())
-    # flatten_module(ast_tree, ResNeXt)
-    # code = format_code(ast.unparse(ast_tree))
-    # with open("temp.py", 'w') as f:
-    #     f.write(code)
-
-    from mmpretrain.models import MAEViT
-
-    def _export_module(obj):
-        obj_cls = obj.__class__
-        file_path = inspect.getfile(obj_cls)
-
-        # 1. transform the relative import
-        # 2. cope files to pack_module_dir.
-        module = obj_cls.__module__
-        # parent, new_file_path = module.split('.', 1)
-        # new_file_path = new_file_path.replace('.', '/') + '.py'
-        new_file_path = 'temp.py'
-
-        # deal with relative import and register cover
-        with open(file_path, 'r+', encoding='utf-8') as f:
-            base_ast_tree = ast.parse(f.read())
-            ModelNodeTransformer(module).visit(base_ast_tree)
-
-        # 记录该文件中需要展平的 class
-        needed_flatten_class_name = []
-        for node in base_ast_tree.body:
-            if isinstance(node, ast.ClassDef):
-                needed_flatten_class_name.append(node.name)
-
-        # 获得该顶层类所在的模块
-        # NOTE: 这里只要是build唤起的模块文件都会被导出
-        imported_module = importlib.import_module(obj_cls.__module__)
-
-        for cls_name in needed_flatten_class_name:
-            cls = getattr(imported_module, cls_name)  # 获得该文件的类
-            is_need_flatten_flag = False
-            for super_cls in cls.__bases__:
-                # 如果父类 在该文件夹/已经是基础类/是torch模块，就没必要继续展开
-                if super_cls.__name__ not in needed_flatten_class_name \
-                    and (super_cls not in [BaseModule,
-                                           BaseModel,
-                                           BaseDataPreprocessor]) \
-                        and 'torch' not in super_cls.__module__:
-                    is_need_flatten_flag = True
-                    break
-            if is_need_flatten_flag:
-                print(f'need_flatten: {cls_name} super {super_cls}')
-                flatten_module(base_ast_tree, cls)
-
-        postprocess_super(base_ast_tree)
-
-        # add "register_module(force=True)"
-        RegisterModuleTransformer().visit(base_ast_tree)
-
-        # unparse ast tree and save reformat code
-        code = ast.unparse(base_ast_tree)
-        with open(new_file_path, mode='w') as f:
-            code = format_code(code)
-            f.write(code)
-
-    _export_module(MAEViT())

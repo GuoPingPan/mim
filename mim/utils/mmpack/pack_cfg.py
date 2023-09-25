@@ -1,12 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import ast
+import copy
 import os
 import os.path as osp
 import shutil
-import urllib.request
+import signal
+import sys
+import time
+import traceback
 from datetime import datetime
-from typing import Union
+from typing import Optional, Union
 
+import requests
 from mmengine import mkdir_or_exist
 from mmengine.config import Config, ConfigDict
 from mmengine.hub import get_config
@@ -16,15 +21,26 @@ from mmengine.runner import Runner
 from .common import MODULE2GitPACKAGE, __init__str, _import_pack_str
 from .utils import *  # noqa: F401,F403
 from .utils import (
+    _get_all_files,
     _replace_config_scope_to_pack,
     _transfer_to_export_import,
     _wrapper_all_registries_build_func,
     format_code,
-    get_all_files,
 )
 
 
-def pack_tools(tool_name: str, scope: str, path: str, auto_import=False):
+def keyboardinterupt_handler(sig: int, frame, export_root_dir: str):
+    """Clear uncompleted exported package by interrupting with keyboard."""
+    if osp.exists(export_root_dir):
+        shutil.rmtree(export_root_dir)
+
+    sys.exit(-1)
+
+
+def pack_tools(tool_name: str,
+               scope: str,
+               path: str,
+               auto_import: Optional[bool] = False):
     """pack tools from web.
 
     Args:
@@ -35,18 +51,32 @@ def pack_tools(tool_name: str, scope: str, path: str, auto_import=False):
     if os.path.exists(path):
         os.remove(path)
 
-    try:
-        web_pth = f'https://raw.githubusercontent.com/open-mmlab/' \
-            f'{MODULE2GitPACKAGE[scope]}/main/tools/{tool_name}'
+    web_pth = f'https://raw.githubusercontent.com/open-mmlab/' \
+        f'{MODULE2GitPACKAGE[scope]}/main/tools/{tool_name}'
 
-        urllib.request.urlretrieve(web_pth, path)
-    except Exception as e:
-        print(f'***********[ERROR:{e}] Network conditions is not good.'
-              f' Reloading... *********** ')
-        web_pth = f'https://gitee.com/guopingpan/{MODULE2GitPACKAGE[scope]}' \
-            f'/raw/main/tools/{tool_name}'
+    max_attempts = 5
+    timeout_seconds = 60
+    attempts = 0
 
-        urllib.request.urlretrieve(web_pth, path)
+    while attempts < max_attempts:
+        try:
+            response = requests.get(web_pth, timeout=timeout_seconds)
+            response.raise_for_status()  # 检查响应状态
+            with open(path, 'wb') as file:
+                file.write(response.content)
+            print(f'[\033[92m Pass \033[0m] Download {path} successful!')
+            break
+        except requests.exceptions.RequestException as e:
+            print(f'Download attempt {attempts + 1} failed: {str(e)}')
+            attempts += 1
+            if attempts < max_attempts:
+                print('Retrying in 5 seconds...')
+                time.sleep(5)
+            else:
+                print(f'[\033[91m ERROR \033[0m] Get tool failed. Please'
+                      f"download manually from '{web_pth}' and put it into"
+                      f" '\033[1m{path}\033[0m'.")
+                sys.exit(0)
 
     # automatically import the pack modules
     if auto_import:
@@ -59,8 +89,8 @@ def pack_tools(tool_name: str, scope: str, path: str, auto_import=False):
 
 
 def export_from_cfg(cfg: Union[str, ConfigDict],
-                    export_root_dir: str = None,
-                    fast_test: bool = False):
+                    export_root_dir: Optional[str] = None,
+                    fast_test: Optional[bool] = False):
     """A function to pack the minimum available package according to config
     file.
 
@@ -76,7 +106,10 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
         else:
             cfg = Config.fromfile(cfg)
 
+    origin_cfg = copy.deepcopy(cfg)
     default_scope = cfg.get('default_scope', 'mmengine')
+    signal.signal(signal.SIGINT, lambda sig, frame: keyboardinterupt_handler(
+        sig, frame, export_root_dir))  # type: ignore[arg-type]
 
     # automatically generate export_root_dir
     if export_root_dir is None:
@@ -117,7 +150,8 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
             cfg.val_dataloader.batch_size = 2
 
         if (cfg.train_cfg.get('type') == 'IterBasedTrainLoop') \
-                or (cfg.train_cfg.get('by_epoch') is None):
+                or (cfg.train_cfg.get('by_epoch') is None
+                    and cfg.train_cfg.get('type') != 'EpochBasedTrainLoop'):
             cfg.train_cfg.max_iters = 2
         else:
             cfg.train_cfg.max_epochs = 2
@@ -143,18 +177,48 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
 
     # wrap ``Registry.build()`` for exporting modules
     _wrapper_all_registries_build_func(
-        pack_module_dir=export_module_dir, scope=default_scope)
+        export_module_dir=export_module_dir, scope=default_scope)
 
     cfg['work_dir'] = osp.join(export_root_dir,
-                               'work_dirs')  # creat temp work_dirs for export
+                               'export_log')  # creat temp work_dirs for export
+
+    def error_postprocess():
+        if osp.exists(export_root_dir):
+            shutil.rmtree(export_root_dir)
+        origin_cfg.dump(cfg_pth.split('/')[-1])
+        traceback.print_exc()
 
     # use runner to export all needed modules
     runner = Runner.from_cfg(cfg)
-    runner.build_train_loop(cfg.train_cfg)
-    if 'val_cfg' in cfg and cfg.val_cfg is not None:
-        runner.build_val_loop(cfg.val_cfg)
-    if 'test_cfg' in cfg and cfg.test_cfg is not None:
-        runner.build_test_loop(cfg.test_cfg)
+    try:
+        runner.build_train_loop(cfg.train_cfg)
+    except FileNotFoundError:
+        error_postprocess()
+        print(f"[\033[94m Debug \033[0m] The data root of 'train_dataloader' "
+              f"is not found. Please modify the 'data_root' in "
+              f"duplicate config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
+        return -1
+
+    try:
+        if 'val_cfg' in cfg and cfg.val_cfg is not None:
+            runner.build_val_loop(cfg.val_cfg)
+    except FileNotFoundError:
+        error_postprocess()
+        print(f"[\033[94m Debug \033[0m] The data root of 'val_dataloader' "
+              f"is not found. Please modify the 'data_root' in duplicate "
+              f"config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
+        return -1
+
+    try:
+        if 'test_cfg' in cfg and cfg.test_cfg is not None:
+            runner.build_test_loop(cfg.test_cfg)
+    except FileNotFoundError:
+        error_postprocess()
+        print(f"[\033[94m Debug \033[0m] The data root of 'test_dataloader' "
+              f"is not found. Please modify the 'data_root' in duplicate "
+              f"config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
+        return -1
+
     if 'optim_wrapper' in cfg and cfg.optim_wrapper is not None:
         runner.optim_wrapper = runner.build_optim_wrapper(cfg.optim_wrapper)
     if 'param_scheduler' in cfg and cfg.param_scheduler is not None:
@@ -172,17 +236,6 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
     # get tools from web
     tools_dir = osp.join(export_root_dir, 'tools')
     os.makedirs(tools_dir, exist_ok=True)
-
-    pack_tools(
-        'train.py',
-        scope=default_scope,
-        path=osp.join(export_root_dir, 'tools/train.py'),
-        auto_import=True)
-    pack_tools(
-        'test.py',
-        scope=default_scope,
-        path=osp.join(export_root_dir, 'tools/test.py'),
-        auto_import=True)
 
     # postprocess for ``pack/registry.py``
     with open(
@@ -227,8 +280,21 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
         f.write(format_code(ast.unparse(ast_tree)))
 
     # postprocess for ImportFrom Node, turn to import from export path
-    all_export_files = get_all_files(export_module_dir)
+    all_export_files = _get_all_files(export_module_dir)
     for file in all_export_files:
         _transfer_to_export_import(file)
 
+    pack_tools(
+        'train.py',
+        scope=default_scope,
+        path=osp.join(export_root_dir, 'tools/train.py'),
+        auto_import=True)
+    pack_tools(
+        'test.py',
+        scope=default_scope,
+        path=osp.join(export_root_dir, 'tools/test.py'),
+        auto_import=True)
+
     # TODO: get demo.py
+
+    return 0

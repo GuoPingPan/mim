@@ -1,8 +1,8 @@
 # Patch Utils
 
-### Problem
+### 问题
 
-This patch is mainly to solve the problem that the module cannot be properly registered due to the renaming of the registry in the downstream repo, such as an example of the `mmsegmentation`:
+该补丁主要是为了解决下游 repo 中存在对注册器进行重命名导致模块无法被正确注册的问题，如 `mmsegmentation` 中的一个例子：
 
 ```python
 # "mmsegmentation/mmseg/structures/sampler/builder.py"
@@ -23,7 +23,7 @@ def build_pixel_sampler(cfg, **default_args):
     return TASK_UTILS.build(cfg, default_args=default_args)
 ```
 
-Some modules may use the renamed registry, which makes it difficult for `mim export` to find the original name of the renamed modules.
+然后在某些模块中可能会使用改名后的注册器，这对于导出后处理很难找到重命名模块原来的名字
 
 ```python
 # "mmsegmentation/mmseg/structures/sampler/ohem_pixel_sampler.py"
@@ -42,9 +42,9 @@ class OHEMPixelSampler(BasePixelSampler):
             ...
 ```
 
-### Solution
+### 解决方案
 
-Therefore, we have currently migrated the necessary modules in `mmpose/mmdetection/mmseg/mmpretrain` listed below, directly to `patch_utils.patch_model` and `patch_utils.patch_task`. In order to build a patch containing renamed registry and special module constructor functions.
+因此我们目前已经将如下 `mmpose / mmdetection / mmseg / mmpretrain` 中必要的模块直接迁移到 `patch_utils.patch_model` 和 `patch_utils.patch_task` 中构建一个包含注册器重命名和特殊模块构造函数的补丁。
 
 ```python
 "mmdetection/mmdet/models/task_modules/builder.py"
