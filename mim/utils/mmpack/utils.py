@@ -7,6 +7,7 @@ import logging
 import os
 import os.path as osp
 import re
+import shutil
 from functools import lru_cache
 from typing import Callable
 
@@ -26,13 +27,10 @@ from mim.utils import OFFICIAL_MODULES
 from .common import BUILDER_TRANS, REGISTRY_TYPE
 from .flatten_func import *  # noqa: F403, F401
 from .flatten_func import (
-    flatten_model,
+    flatten_inheritance_chain,
     ignore_ast_docstring,
-    init_prepare,
-    postprocess_super,
-    postprocess_top_ast_tree,
+    postprocess_super_call,
 )
-
 
 def format_code(code_text: str):
     """Format the code text with yapf."""
@@ -49,6 +47,70 @@ def format_code(code_text: str):
                           f'check the syntax of: \n{code_text}')
 
     return code_text
+
+
+def _postprocess_registry_locations(export_root_dir: str):
+    """Remove the Registry.locations if it doesn't exist.
+
+    Check the location path for Registry to load modules if the path hasn't
+    been exported, then need to be removed. Finally will use the root Registry
+    to find module until it actually doesn't exist.
+    """
+    export_module_dir = osp.join(export_root_dir, 'pack')
+
+    with open(
+            osp.join(export_module_dir, 'registry.py'), encoding='utf-8') as f:
+        ast_tree = ast.parse(f.read())
+
+    for node in ast.walk(ast_tree):
+        """node structure.
+
+        Assign(     targets=[         Name(id='EVALUATORS', ctx=Store())],
+        value=Call(         func=Name(id='Registry', ctx=Load()),
+        args=[             Constant(value='evaluator')],         keywords=[
+        keyword(                 arg='parent',
+        value=Name(id='MMENGINE_EVALUATOR', ctx=Load())),             keyword(
+        arg='locations',                 value=List(                     elts=[
+        Constant(value='pack.evaluation')],
+        ctx=Load()))])),
+        """
+        if isinstance(node, ast.Call):
+            need_to_be_remove = None
+
+            for keyword in node.keywords:
+                if keyword.arg == 'locations':
+                    for sub_node in ast.walk(keyword):
+
+                        # the locations of Registry already transfer to `pack` scope before.
+                        # if the location path is exist, then turn to pack scope  # noqa: E501
+                        if isinstance(
+                                sub_node,
+                                ast.Constant) and 'pack' in sub_node.value:
+
+                            path = sub_node.value
+                            if not osp.exists(
+                                    osp.join(export_root_dir, path).replace(
+                                        '.', '/')):
+                                print_log(
+                                    '[ Pass ] Remove Registry.locations '  # noqa: E501
+                                    f"'{osp.join(export_root_dir, path).replace('.','/')}', "  # noqa: E501
+                                    'which is no need to export.',  # noqa: E501
+                                    logger='export',
+                                    level=logging.DEBUG
+                                )
+                                need_to_be_remove = keyword
+                                break
+
+                if need_to_be_remove is not None:
+                    break
+
+            if need_to_be_remove is not None:
+                node.keywords.remove(need_to_be_remove)
+
+    with open(
+            osp.join(export_module_dir, 'registry.py'), 'w',
+            encoding='utf-8') as f:
+        f.write(format_code(ast.unparse(ast_tree)))
 
 
 def _get_all_files(directory: str):
@@ -69,7 +131,7 @@ def _get_all_files(directory: str):
     return file_paths
 
 
-def _transfer_to_export_import(file_path: str):
+def _postprocess_importfrom_module_to_pack(file_path: str):
     """Transfer the importfrom path from "downstream repo" to export module.
 
     Args:
@@ -114,6 +176,7 @@ def _transfer_to_export_import(file_path: str):
         needed_change_alias = []
 
         for alias in node.names:
+            # if the import module's name is equal to the class or function name, it can not be transfer for avoiding circular import.
             if alias.name in _module_path_dict.keys(
             ) and alias.name not in can_not_change_module:
 
@@ -154,6 +217,7 @@ def _transfer_to_export_import(file_path: str):
             temp_node = check_change_importfrom_node(node)
             if temp_node is not None:
                 if len(node.names) == 0:
+                    # import ipdb; ipdb.set_trace()
                     ast_tree.body[insert_idx - 1] = temp_node
                 else:
                     insert_idx_and_node[insert_idx] = temp_node
@@ -166,7 +230,7 @@ def _transfer_to_export_import(file_path: str):
             # search ast.ImportFrom in ast.FunctionDef scope
             # ast.Module -> ast.FunctionDef -> ast.ImportFrom
             if isinstance(node, ast.FunctionDef):
-                insert_idx = ignore_ast_docstring(node)
+                temp_func_insert_idx = ignore_ast_docstring(node)
                 func_need_to_be_removed_nodes = []
 
                 for func_sub_node in node.body:
@@ -174,7 +238,7 @@ def _transfer_to_export_import(file_path: str):
                         temp_node = check_change_importfrom_node(
                             func_sub_node)  # noqa: E501
                         if temp_node is not None:
-                            node.body.insert(insert_idx, temp_node)
+                            node.body.insert(temp_func_insert_idx, temp_node)
 
                         # if importfrom module is empty, the node should be remove  # noqa: E501
                         if len(func_sub_node.names) == 0:
@@ -188,7 +252,7 @@ def _transfer_to_export_import(file_path: str):
             # ast.Module -> ast.ClassDef -> ast.ImportFrom
             #                            -> ast.FunctionDef -> ast.ImportFrom
             elif isinstance(node, ast.ClassDef):
-                insert_idx = ignore_ast_docstring(node)
+                temp_class_insert_idx = ignore_ast_docstring(node)
                 class_need_to_be_removed_nodes = []
 
                 for class_sub_node in node.body:
@@ -198,14 +262,14 @@ def _transfer_to_export_import(file_path: str):
                         temp_node = check_change_importfrom_node(
                             class_sub_node)
                         if temp_node is not None:
-                            node.body.insert(insert_idx, temp_node)
+                            node.body.insert(temp_class_insert_idx, temp_node)
                         if len(class_sub_node.names) == 0:
                             class_need_to_be_removed_nodes.append(
                                 class_sub_node)
 
                     # ast.Module -> ast.ClassDef -> ast.FunctionDef -> ast.ImportFrom  # noqa: E501
                     elif isinstance(class_sub_node, ast.FunctionDef):
-                        class_sub_insert_idx = ignore_ast_docstring(node)
+                        temp_class_sub_insert_idx = ignore_ast_docstring(node)
                         func_need_to_be_removed_nodes = []
 
                         for func_sub_class_sub_node in class_sub_node.body:
@@ -214,7 +278,7 @@ def _transfer_to_export_import(file_path: str):
                                 temp_node = check_change_importfrom_node(
                                     func_sub_class_sub_node)
                                 if temp_node is not None:
-                                    node.body.insert(class_sub_insert_idx,
+                                    node.body.insert(temp_class_sub_insert_idx,
                                                      temp_node)
                                 if len(func_sub_class_sub_node.names) == 0:
                                     func_need_to_be_removed_nodes.append(
@@ -266,23 +330,22 @@ def _wrapper_all_registries_build_func(export_module_dir: str, scope: str):
         pack_module_dir (str): The root dir for packing modules.
         scope (str): The default scope of the config.
     """
-    import importlib
-    import shutil
-
     # copy the downstream repo.registry to pack.registry
     # and change all the registry.locations
     repo_registries = importlib.import_module('.registry', scope)
     origin_file = inspect.getfile(repo_registries)
-    shutil.copy(origin_file, osp.join(export_module_dir, 'registry.py'))
+    registry_path = osp.join(export_module_dir, 'registry.py')
+    shutil.copy(origin_file, registry_path)
 
+    # replace 'repo' name in Registry.locations to 'pack'
     with open(
-            osp.join(export_module_dir, 'registry.py'), 'r+',
+            osp.join(export_module_dir, 'registry.py'),
             encoding='utf-8') as f:
         ast_tree = ast.parse(f.read())
         for node in ast.walk(ast_tree):
             if isinstance(node, ast.Constant):
-                if 'mm' in node.value:
-                    node.value = 'pack.' + node.value.split('.', 1)[-1]
+                if scope in node.value:
+                    node.value = node.value.replace(scope, 'pack')
 
     with open(osp.join(export_module_dir, 'registry.py'), 'w') as f:
         f.write(format_code(ast.unparse(ast_tree)))
@@ -295,13 +358,14 @@ def _wrapper_all_registries_build_func(export_module_dir: str, scope: str):
 
     # prevent circular wrapper
     if Registry.build.__name__ == 'wrapper':
-        Registry.build = _build(Registry.init_build_func, export_module_dir)
-        Registry.get = _get(Registry.init_get_func, export_module_dir)
+        Registry.build = _wrap_build(Registry.init_build_func,
+                                     export_module_dir)
+        Registry.get = _wrap_get(Registry.init_get_func, export_module_dir)
     else:
         Registry.init_build_func = copy.deepcopy(Registry.build)
         Registry.init_get_func = copy.deepcopy(Registry.get)
-        Registry.build = _build(Registry.build, export_module_dir)
-        Registry.get = _get(Registry.get, export_module_dir)
+        Registry.build = _wrap_build(Registry.build, export_module_dir)
+        Registry.get = _wrap_get(Registry.get, export_module_dir)
 
 
 @lru_cache
@@ -333,7 +397,7 @@ def _export_module(self, obj_cls: type, pack_module_dir, obj_type: str):
         print_log(
             f'[package: {pack_module_dir} ] building class: '
             f'{obj_cls.__name__} from file: {file_path}.',
-            logger='current',
+            logger='export',
             level=logging.INFO)
     else:
         raise FileExistsError(f"file [{file_path}] doesn't exist.")
@@ -344,7 +408,7 @@ def _export_module(self, obj_cls: type, pack_module_dir, obj_type: str):
     new_module = module.replace(parent, 'pack')
 
     # Not necessary to export module implemented in `mmcv` and `mmengine`
-    if parent not in set(OFFICIAL_MODULES) - {'mmcv', 'mmengine'}:
+    if parent in set(OFFICIAL_MODULES) - {'mmcv', 'mmengine'}:
 
         with open(file_path, encoding='utf-8') as f:
             top_ast_tree = ast.parse(f.read())
@@ -383,15 +447,16 @@ def _export_module(self, obj_cls: type, pack_module_dir, obj_type: str):
                                                ImgDataPreprocessor]) \
                             and 'torch' not in super_cls.__module__:  # noqa: E501
 
-                        print(f'need_flatten: {cls_name} super {super_cls}')
-                        flatten_module(top_ast_tree, cls)
+                        print_log(f'need_flatten: {cls_name} super'
+                                  f' {super_cls}',
+                                  logger='export',
+                                  level=logging.INFO)
+                        flatten_inheritance_chain(top_ast_tree, cls)
                         break
-            postprocess_super(top_ast_tree)
-
+            postprocess_super_call(top_ast_tree)
 
         else:
-            self._module_path_dict[
-                obj_cls.__name__] = new_module
+            self._module_path_dict[obj_cls.__name__] = new_module
 
         # add ``register_module(force=True)`` to cover the registered modules  # noqa: E501
         RegisterModuleTransformer().visit(top_ast_tree)
@@ -429,7 +494,7 @@ def _export_module(self, obj_cls: type, pack_module_dir, obj_type: str):
                 )
 
 
-def _build(build_func: Callable, pack_module_dir: str):
+def _wrap_build(build_func: Callable, pack_module_dir: str):
     """wrap Registry.build()
 
     Args:
@@ -458,7 +523,7 @@ def _build(build_func: Callable, pack_module_dir: str):
     return wrapper
 
 
-def _get(get_func: Callable, pack_module_dir: str):
+def _wrap_get(get_func: Callable, pack_module_dir: str):
     """wrap Registry.get()
 
     Args:
@@ -476,92 +541,6 @@ def _get(get_func: Callable, pack_module_dir: str):
 
     return wrapper
 
-
-def flatten_module(top_ast_tree: ast.Module, obj_cls: type):
-    """Flatten the module. (Key Interface)
-
-    The logic of the ``flatten_module`` are as below.
-    First, get the inheritance_chain by ``class.mro()`` and prune it.
-    Second, get the file of chosen top class and parse it to
-        be ``top_ast_tree``.
-    Third, call ``init_prepare()`` to collect the information of
-        ``top_ast_tree``.
-
-    Last, for each super class in the inheritance_chain, we will do:
-        1. parse the super class file as  ``super_ast_tree`` and
-            do preprocess.
-        2. call ``flatten_model()`` to visit necessary node
-            in ``super_ast_tree`` to change needed flattened class node and
-            record the information for flatten.
-        3. call ``postprocess_ast_tree()`` with the information got from
-           ``flatten_model()`` to change the ``top_ast_tree``.
-
-    In summary, ``top_ast_tree`` is the most important ast tree maintained and
-    updated from the begin to the end.
-
-    Args:
-        top_ast_tree (ast.Module): The top ast tree contains the classes
-            directly called, which is continually updated.
-        obj_cls (object): The chosen top class to be flattened.
-    """
-    print(
-        f'------------- flatten model [{obj_cls.__name__}] -------------\n', )
-    print(f'*[mro]: {obj_cls.mro()}\n')
-
-    # get inheritance_chain
-    inheritance_chain = []
-    for cls in obj_cls.mro():
-        if cls in [
-                BaseModule, BaseModel, BaseDataPreprocessor,
-                ImgDataPreprocessor, obj_cls
-        ] or 'torch' in cls.__module__:
-            break
-        inheritance_chain.append(cls)
-    print(f'*[inheritance_chain]: {inheritance_chain}\n')
-
-    # collect the init information of ``top_ast_tree``
-    import_from_dict_top, import_list_top, class_dict_top, assign_list_top, \
-        try_list_top, if_list_top, import_from_asname_dict_top \
-        = init_prepare(top_ast_tree, obj_cls.__name__)
-
-    # iteratively deal with the super class
-    for cls in inheritance_chain:
-
-        modul_pth = inspect.getfile(cls)
-        with open(modul_pth) as f:
-            super_ast_tree = ast.parse(f.read())
-
-        ImportResolverTransformer(cls.__module__).visit(super_ast_tree)
-
-        # collect the difference between ``top_ast_tree`` and ``super_ast_tree``  # noqa: E501
-        used_module_dict_super, extra_import_list_super, \
-            extra_import_from_dict_super = flatten_model(
-                super_ast_tree=super_ast_tree,
-                class_dict_top=class_dict_top,
-                importfrom_dict_top=import_from_dict_top,
-                import_list_top=import_list_top,
-                assign_list_top=assign_list_top,
-                if_list_top=if_list_top,
-                try_list_top=try_list_top,
-                importfrom_asname_dict_top=import_from_asname_dict_top)
-
-        # update ``top_ast_tree``
-        postprocess_top_ast_tree(
-            super_ast_tree,
-            top_ast_tree,
-            used_module_dict_super,
-            extra_import_from_dict_super,
-            extra_import_list_super,
-            class_dict_top,
-            assign_list_top,
-            try_list_top,
-            if_list_top,
-            import_from_dict_top,
-            import_list_top,
-        )
-
-    print(
-        f'------------- flatten model [{obj_cls.__name__}] -------------\n', )
 
 
 class RegisterModuleTransformer(ast.NodeTransformer):
@@ -613,7 +592,7 @@ class ImportResolverTransformer(ast.NodeTransformer):
             # However, some algorithm libraries, such as `mmpose`, provide aliases
             # for `MODELS`, `TASK_UTILS`, and other registries,
             # as seen here: https://github.com/open-mmlab/mmpose/blob/537bd8e543ab463fb55120d5caaa1ae22d6aaf06/mmpose/models/builder.py#L13.
-            
+
             # For these registries with aliases, we cannot directly import from
             # `pack.registry` because `pack.registry` is copied from
             # `mmpose.registry` and does not contain these aliases.
@@ -627,22 +606,23 @@ class ImportResolverTransformer(ast.NodeTransformer):
                 node.module = 'mim.utils.mmpack.patch_utils.patch_task'
             node.level = 0
             return node
-        
-        if node.level == 0:
+
+        else:
+            # deal with relative import
+            if node.level != 0:
+                import_prefix = '.'.join(
+                    self.import_prefix.split('.')[:-node.level])
+                if node.module is not None:
+                    node.module = import_prefix + '.' + node.module
+                else:
+                    # from . import xxx
+                    node.module = import_prefix
+                node.level = 0
+
             if 'registry' in node.module \
                     and not node.module.startswith('mmengine'):
                 node.module = 'pack.registry'
 
-        # deal with relative import
-        else:
-            import_prefix = '.'.join(
-                self.import_prefix.split('.')[:-node.level])
-            if node.module is not None:
-                node.module = import_prefix + '.' + node.module
-            else:
-                # from . import xxx
-                node.module = import_prefix
-            node.level = 0
         return node
 
     # TODO: resolve Import Node

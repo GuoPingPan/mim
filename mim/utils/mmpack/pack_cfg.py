@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import ast
 import copy
+import logging
 import os
 import os.path as osp
 import shutil
@@ -10,23 +11,159 @@ import traceback
 from datetime import datetime
 from typing import Optional, Union
 
-from mmengine import mkdir_or_exist
-from mmengine.config.utils import MODULE2PACKAGE
 from mmengine.config import Config, ConfigDict
 from mmengine.hub import get_config
+from mmengine.logging import MMLogger
 from mmengine.registry import init_default_scope
 from mmengine.runner import Runner
-from importlib.util import find_spec
+from mmengine.utils import get_installed_path, mkdir_or_exist
 
-from .common import __init__str, _import_pack_str
+from .common import _import_pack_str, _init_str
 from .utils import *  # noqa: F401,F403
 from .utils import (
     _get_all_files,
+    _postprocess_importfrom_module_to_pack,
+    _postprocess_registry_locations,
     _replace_config_scope_to_pack,
-    _transfer_to_export_import,
     _wrapper_all_registries_build_func,
-    format_code,
 )
+
+
+def export_from_cfg(cfg: Union[str, ConfigDict],
+                    export_root_dir: Optional[str] = None,
+                    fast_test: Optional[bool] = False,
+                    model_only: Optional[bool] = False):
+    """A function to pack the minimum available package according to config
+    file.
+
+    Args:
+        cfg  (:obj:`ConfigDict` or str): Config file for packing the
+            minimum package.
+        export_root_dir (str, optional): The pack directory to save the packed package.
+        fast_test (bool, optional): Trun to fast testing mode. Defaults to "False".
+    """
+    # delete the uncomplete export package when keyboard interupt
+    signal.signal(signal.SIGINT, lambda sig, frame: keyboardinterupt_handler(
+        sig, frame, export_root_dir))  # type: ignore[arg-type]
+
+    # get config
+    if isinstance(cfg, str):
+        if '::' in cfg:
+            cfg = get_config(cfg)
+        else:
+            cfg = Config.fromfile(cfg)
+
+    origin_cfg = copy.deepcopy(cfg)
+    default_scope = cfg.get('default_scope', 'mmengine')
+
+    # automatically generate ``export_root_dir`` and ``export_module_dir``
+    if export_root_dir is None:
+        export_root_dir = f"pack_from_{default_scope}_{datetime.now().strftime(r'%Y%m%d_%H%M%S')}"    
+    
+    if osp.sep in export_root_dir:
+        export_path = osp.dirname(export_root_dir)
+    else:
+        export_path = os.getcwd()
+
+    export_log = MMLogger(
+        "export",
+        log_file=osp.join(export_path, 'export.log'),
+    )
+
+    export_module_dir = osp.join(export_root_dir, 'pack')
+    if osp.exists(export_module_dir):
+        shutil.rmtree(export_module_dir)
+
+    # export config
+    if '.mim/' in cfg.filename:
+        cfg_path = osp.join(export_module_dir, cfg.filename.split('.mim/')[-1])
+    else:
+        cfg_path = osp.join(
+            osp.join(export_module_dir, 'configs'),
+            cfg.filename.split('/')[-1])
+    mkdir_or_exist(osp.dirname(cfg_path))
+
+    # NOTE: use less data for faster testing
+    fast_test_mode(cfg, fast_test)
+
+    cfg.dump(cfg_path)
+    _replace_config_scope_to_pack(cfg_path)
+
+    # transform to default_scope
+    init_default_scope(default_scope)
+
+    # wrap ``Registry.build()`` for exporting modules
+    _wrapper_all_registries_build_func(
+        export_module_dir=export_module_dir, scope=default_scope)
+
+    cfg['work_dir'] = osp.join(export_root_dir,
+                               'export_log')  # creat temp work_dirs for export
+    # use runner to export all needed modules
+    runner = Runner.from_cfg(cfg)
+    
+    if model_only:
+        return 0
+    
+    try:
+        runner.build_train_loop(cfg.train_cfg)
+    except FileNotFoundError:
+        error_postprocess(export_root_dir, cfg_path, origin_cfg,
+                          'train_dataloader', runner.logger)
+
+    try:
+        if 'val_cfg' in cfg and cfg.val_cfg is not None:
+            runner.build_val_loop(cfg.val_cfg)
+    except FileNotFoundError:
+        error_postprocess(export_root_dir, cfg_path, origin_cfg,
+                          'val_dataloader', runner.logger)
+
+    try:
+        if 'test_cfg' in cfg and cfg.test_cfg is not None:
+            runner.build_test_loop(cfg.test_cfg)
+    except FileNotFoundError:
+        error_postprocess(export_root_dir, cfg_path, origin_cfg,
+                          'test_dataloader', runner.logger)
+
+    if 'optim_wrapper' in cfg and cfg.optim_wrapper is not None:
+        runner.optim_wrapper = runner.build_optim_wrapper(cfg.optim_wrapper)
+    if 'param_scheduler' in cfg and cfg.param_scheduler is not None:
+        runner.build_param_scheduler(cfg.param_scheduler)
+
+    # add ``__init__.py`` to all dirs, for transferring directories
+    # to be modules
+    for directory, _, _ in os.walk(export_module_dir):
+        if not osp.exists(osp.join(directory, '__init__.py')) \
+                and 'configs' not in directory \
+                and not directory.endswith(f'{export_module_dir}/'):
+            with open(osp.join(directory, '__init__.py'), 'w') as f:
+                f.write(_init_str)
+
+    # postprocess for ``pack/registry.py``
+    _postprocess_registry_locations(export_root_dir)
+
+    # postprocess for ImportFrom Node, turn to import from export path
+    all_export_files = _get_all_files(export_module_dir)
+    for file in all_export_files:
+        _postprocess_importfrom_module_to_pack(file)
+
+    # get tools from web
+    tools_dir = osp.join(export_root_dir, 'tools')
+    os.makedirs(tools_dir, exist_ok=True)
+
+    pack_tools(
+        'train.py',
+        scope=default_scope,
+        path=osp.join(export_root_dir, 'tools/train.py'),
+        auto_import=True)
+    pack_tools(
+        'test.py',
+        scope=default_scope,
+        path=osp.join(export_root_dir, 'tools/test.py'),
+        auto_import=True)
+
+    # TODO: get demo.py
+
+    return 0
 
 
 def keyboardinterupt_handler(sig: int, frame, export_root_dir: str):
@@ -37,22 +174,67 @@ def keyboardinterupt_handler(sig: int, frame, export_root_dir: str):
     sys.exit(-1)
 
 
+def error_postprocess(export_root_dir: str, absolute_cfg_path: str,
+                      origin_cfg: ConfigDict, error_key: str, logger):
+    """Print Debug message when package can't successfully export for missing
+    datasets.
+
+    Args:
+        export_root_dir (str): _description_
+        absolute_cfg_path (str): _description_
+        origin_cfg (ConfigDict): _description_
+        error_key (str): _description_
+        logger (_type_): _description_
+    """
+    if osp.exists(export_root_dir):
+        shutil.rmtree(export_root_dir)
+
+    origin_cfg.dump(osp.dirname(absolute_cfg_path))
+    traceback.print_exc()
+
+    # print(f"[\033[94m Debug \033[0m] The data root of '{error_key}' "
+    #         f"is not found. Please modify the 'data_root' in "
+    #         f"duplicate config '\033[1m{osp.basename(absolute_cfg_path)}\033[0m'.")
+
+    # TODO: modified to print_log
+    # Examples:
+    # >>> 09/29 16:45:56 - mmengine - ERROR - /home/panguoping/mm/only_for_test/mmengine/mmengine/logging/logger.py - print_log - 350 - The data root of 'train_dataloader'is not found. Please modify the 'data_root' in duplicate config 'gl_8xb12_celeba-256x256.py'.
+    print_log(
+        f"The data root of '{error_key}'"
+        f"is not found. Please modify the 'data_root' in "
+        f"duplicate config '{osp.basename(absolute_cfg_path)}' or use"
+        f"'--model_only' to export model only.'",
+        logger='export',
+        level=logging.ERROR)
+
+    sys.exit(-1)
+
+
 def pack_tools(tool_name: str,
                scope: str,
                path: str,
                auto_import: Optional[bool] = False):
-    """pack tools from web.
+    """pack tools from installed repo.
 
     Args:
-        tool_name (str): the tool name in repo tools dir
-        scope (str): the scope of repo
-        path (str): the path to save tool
+        tool_name (str): Tool name in repos' tool dir.
+        scope (str): The scope of repo.
+        path (str): Path to save tool.
+        auto_import (bool, optional): Automatically add "import pack" to the
+            tool file. Defaults to "False"
     """
+    pkg_root = get_installed_path(scope)
+
     if os.path.exists(path):
         os.remove(path)
 
-    path = osp.join(
-        osp.dirname(find_spec(scope).origin), '.mim', , 'tools', tool_name)
+    # tools will be put in package/.mim in PR #68
+    tool_script = osp.join(pkg_root, '.mim', 'tools', tool_name)
+    if not osp.exists(tool_script):
+        tool_script = osp.join(pkg_root, 'tools', tool_name)
+
+    shutil.copy(tool_script, path)
+
     # automatically import the pack modules
     if auto_import:
         with open(path, 'r+') as f:
@@ -63,51 +245,13 @@ def pack_tools(tool_name: str,
             f.truncate()
 
 
-def export_from_cfg(cfg: Union[str, ConfigDict],
-                    export_root_dir: Optional[str] = None,
-                    fast_test: Optional[bool] = False):
-    """A function to pack the minimum available package according to config
-    file.
+def fast_test_mode(cfg, fast_test: bool = False):
+    """Use less data for faster testing.
 
     Args:
-        cfg  (:obj:`ConfigDict` or str): The config file for packing the
-            minimum package.
-        pack_root_dir (str): The pack directory to save the packed package.
+        cfg (ConfigDict): Config of export package.
+        fast_test (bool, optional): Fast testing mode. Defaults to False.
     """
-    # get config
-    if isinstance(cfg, str):
-        if '::' in cfg:
-            cfg = get_config(cfg)
-        else:
-            cfg = Config.fromfile(cfg)
-
-    origin_cfg = copy.deepcopy(cfg)
-    default_scope = cfg.get('default_scope', 'mmengine')
-    signal.signal(signal.SIGINT, lambda sig, frame: keyboardinterupt_handler(
-        sig, frame, export_root_dir))  # type: ignore[arg-type]
-
-    # automatically generate export_root_dir
-    if export_root_dir is None:
-        export_root_dir = f'pack_from_{default_scope}_' + datetime.now(
-        ).strftime(r'%Y%m%d_%H%M%S')
-
-    # export_module_dir
-    export_module_dir = export_root_dir + '/pack'
-    if osp.exists(export_module_dir):
-        shutil.rmtree(export_module_dir)
-
-    # export config
-    if '.mim/' in cfg.filename:
-        cfg_dir = osp.join(export_module_dir,
-                           osp.dirname(cfg.filename.split('.mim/')[-1]))
-        cfg_pth = osp.join(export_module_dir, cfg.filename.split('.mim/')[-1])
-    else:
-        cfg_dir = osp.join(export_module_dir, 'configs')
-        cfg_pth = osp.join(cfg_dir, cfg.filename.split('/')[-1])
-
-    mkdir_or_exist(cfg_dir)
-
-    # NOTE: change parameters for fasterfast_ testing
     if fast_test:
         # for batch_norm using at least 2 data
         if 'dataset' in cfg.train_dataloader.dataset:
@@ -142,136 +286,3 @@ def export_from_cfg(cfg: Union[str, ConfigDict],
             else:
                 cfg.param_scheduler.begin = 0
                 cfg.param_scheduler.end = 2
-
-    cfg.dump(cfg_pth)
-
-    _replace_config_scope_to_pack(cfg_pth)
-
-    # transform to default_scope
-    init_default_scope(default_scope)
-
-    # wrap ``Registry.build()`` for exporting modules
-    _wrapper_all_registries_build_func(
-        export_module_dir=export_module_dir, scope=default_scope)
-
-    cfg['work_dir'] = osp.join(export_root_dir,
-                               'export_log')  # creat temp work_dirs for export
-
-    def error_postprocess():
-        if osp.exists(export_root_dir):
-            shutil.rmtree(export_root_dir)
-        origin_cfg.dump(cfg_pth.split('/')[-1])
-        traceback.print_exc()
-
-    # use runner to export all needed modules
-    runner = Runner.from_cfg(cfg)
-    try:
-        runner.build_train_loop(cfg.train_cfg)
-    except FileNotFoundError:
-        error_postprocess()
-        print(f"[\033[94m Debug \033[0m] The data root of 'train_dataloader' "
-              f"is not found. Please modify the 'data_root' in "
-              f"duplicate config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
-        return -1
-
-    try:
-        if 'val_cfg' in cfg and cfg.val_cfg is not None:
-            runner.build_val_loop(cfg.val_cfg)
-    except FileNotFoundError:
-        error_postprocess()
-        print(f"[\033[94m Debug \033[0m] The data root of 'val_dataloader' "
-              f"is not found. Please modify the 'data_root' in duplicate "
-              f"config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
-        return -1
-
-    try:
-        if 'test_cfg' in cfg and cfg.test_cfg is not None:
-            runner.build_test_loop(cfg.test_cfg)
-    except FileNotFoundError:
-        error_postprocess()
-        print(f"[\033[94m Debug \033[0m] The data root of 'test_dataloader' "
-              f"is not found. Please modify the 'data_root' in duplicate "
-              f"config '\033[1m{cfg_pth.split('/')[-1]}\033[0m'.")
-        return -1
-
-    if 'optim_wrapper' in cfg and cfg.optim_wrapper is not None:
-        runner.optim_wrapper = runner.build_optim_wrapper(cfg.optim_wrapper)
-    if 'param_scheduler' in cfg and cfg.param_scheduler is not None:
-        runner.build_param_scheduler(cfg.param_scheduler)
-
-    # add ``__init__.py`` to all dirs, for transferring directories
-    # to be modules
-    for directory, _, _ in os.walk(export_module_dir):
-        if not osp.exists(osp.join(directory, '__init__.py')) \
-                and 'configs' not in directory \
-                and not directory.endswith(f'{export_module_dir}/'):
-            with open(osp.join(directory, '__init__.py'), 'w') as f:
-                f.write(__init__str)
-
-    # get tools from web
-    tools_dir = osp.join(export_root_dir, 'tools')
-    os.makedirs(tools_dir, exist_ok=True)
-
-    # postprocess for ``pack/registry.py``
-    with open(
-            osp.join(export_module_dir, 'registry.py'), encoding='utf-8') as f:
-        ast_tree = ast.parse(f.read())
-
-    for node in ast.walk(ast_tree):
-        # check the location path for Registry to load modules
-        # if the path hasn't been exported, then need to be removed.
-        # finally will use the root Registry to find module until it
-        # actually doesn't exist.
-        if isinstance(node, ast.Call):
-            need_to_be_remove = None
-
-            for keyword in node.keywords:
-                if keyword.arg == 'locations':
-                    for sub_node in ast.walk(keyword):
-
-                        # if the location path is exist, then turn to pack scope  # noqa: E501
-                        if isinstance(
-                                sub_node,
-                                ast.Constant) and 'pack' in sub_node.value:
-                            path = sub_node.value
-                            if not osp.exists(
-                                    osp.join(export_root_dir, path).replace(
-                                        '.', '/')):
-                                print(
-                                    '[\033[92m Pass \033[0m] Remove Registry.locations '  # noqa: E501
-                                    f"'{osp.join(export_root_dir,path).replace('.','/')}', "  # noqa: E501
-                                    'which is no need to export.'  # noqa: E501
-                                )
-                                need_to_be_remove = keyword
-                                break
-
-                if need_to_be_remove is not None:
-                    break
-
-            if need_to_be_remove is not None:
-                node.keywords.remove(need_to_be_remove)
-
-    with open(
-            osp.join(export_module_dir, 'registry.py'), 'w',
-            encoding='utf-8') as f:
-        f.write(format_code(ast.unparse(ast_tree)))
-
-    # postprocess for ImportFrom Node, turn to import from export path
-    all_export_files = _get_all_files(export_module_dir)
-    for file in all_export_files:
-        _transfer_to_export_import(file)
-
-    pack_tools(
-        'train.py',
-        scope=default_scope,
-        path=osp.join(export_root_dir, 'tools/train.py'),
-        auto_import=True)
-    pack_tools(
-        'test.py',
-        scope=default_scope,
-        path=osp.join(export_root_dir, 'tools/test.py'),
-        auto_import=True)
-
-    # TODO: get demo.py
-
-    return 0

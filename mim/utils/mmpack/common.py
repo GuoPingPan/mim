@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 # initialization template for __init__.py
-__init__str = """
+_init_str = """
 import os
 import os.path as osp
 
